@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Tuple
 from collections import defaultdict
+from nltk import ngrams
 
 custom_stopwords = {
     "a", "abord", "absolument", "afin", "ah", "ai", "aie", "ailleurs", "ainsi",
@@ -95,17 +96,36 @@ custom_stopwords = {
 french_stopwords = custom_stopwords
 
 
-def analyze_co_occurrences(text, target_words, window_size=5):
+# def analyze_co_occurrences(text, target_words, window_size=5):
+#     words = text.lower().split()
+#     co_occurrences = {word: defaultdict(int) for word in target_words}
+
+#     for i, word in enumerate(words):
+#         if word in target_words:
+#             start = max(0, i - window_size)
+#             end = min(len(words), i + window_size + 1)
+#             for j in range(start, end):
+#                 if i != j and words[j] not in french_stopwords:
+#                     co_occurrences[word][words[j]] += 1
+
+#     return co_occurrences
+
+def analyze_co_occurrences(text, target_words, window_size=5, n_gram_range=(1, 3)):
     words = text.lower().split()
     co_occurrences = {word: defaultdict(int) for word in target_words}
 
-    for i, word in enumerate(words):
-        if word in target_words:
-            start = max(0, i - window_size)
-            end = min(len(words), i + window_size + 1)
-            for j in range(start, end):
-                if i != j and words[j] not in french_stopwords:
-                    co_occurrences[word][words[j]] += 1
+    for n in range(n_gram_range[0], n_gram_range[1] + 1):
+        n_grams = list(ngrams(words, n))
+        for i, gram in enumerate(n_grams):
+            gram_str = ' '.join(gram)
+            if gram_str in target_words:
+                start = max(0, i - window_size)
+                end = min(len(n_grams), i + window_size + 1)
+                for j in range(start, end):
+                    if i != j:
+                        context_gram = ' '.join(n_grams[j])
+                        if not any(word in french_stopwords for word in context_gram.split()):
+                            co_occurrences[gram_str][context_gram] += 1
 
     return co_occurrences
 
@@ -130,7 +150,8 @@ def get_page_content(url: str) -> str:
         return ''
 
 
-def get_serp_semantic_field(query: str, api_key: str, cse_id: str, num_results: int = 20, num_words: int = 75) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Dict[str, int]]]:
+@st.cache_data
+def get_serp_semantic_field(query: str, api_key: str, cse_id: str, num_results: int = 10, num_words: int = 75) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Dict[str, int]]]:
     """
     Extrait le champ sémantique et les entités nommées à partir des résultats de recherche Google.
 
@@ -148,6 +169,7 @@ def get_serp_semantic_field(query: str, api_key: str, cse_id: str, num_results: 
 
     results_text = ""
     urls = []
+    word_occurrences_per_url = defaultdict(dict)
 
     for start in range(1, num_results, 10):
         try:
@@ -167,23 +189,50 @@ def get_serp_semantic_field(query: str, api_key: str, cse_id: str, num_results: 
             try:
                 page_content = future.result()
                 results_text += page_content
+
+                # Compter les occurrences des mots pour chaque URL
+                words = page_content.lower().split()
+                for word in words:
+                    if word not in french_stopwords and len(word) > 3:
+                        if word not in word_occurrences_per_url:
+                            word_occurrences_per_url[word] = {}
+                        word_occurrences_per_url[word][url] = word_occurrences_per_url[word].get(url, 0) + 1
+
+                # Compter les occurrences des bi-grams et tri-grams
+                bigrams = list(ngrams(words, 2))
+                trigrams = list(ngrams(words, 3))
+                for gram in bigrams + trigrams:
+                    gram_str = ' '.join(gram)
+                    if not any(word in french_stopwords for word in gram):
+                        if gram_str not in word_occurrences_per_url:
+                            word_occurrences_per_url[gram_str] = {}
+                        word_occurrences_per_url[gram_str][url] = word_occurrences_per_url[gram_str].get(url, 0) + 1
+
             except Exception as exc:
                 print(f"Une erreur s'est produite lors du traitement de {url}: {exc}")
 
     words = results_text.lower().split()
     word_counts = Counter(words)
-    semantic_field = {word: count for word, count in word_counts.items() if word not in french_stopwords and len(word) > 3}
 
-    # Trier le champ sémantique et prendre les 10 premiers mots
+    bigrams = list(ngrams(words, 2))
+    trigrams = list(ngrams(words, 3))
+
+    bigram_counts = Counter([' '.join(gram) for gram in bigrams])
+    trigram_counts = Counter([' '.join(gram) for gram in trigrams])
+
+    semantic_field = {word: count for word, count in word_counts.items()
+                      if word not in french_stopwords and len(word) > 3}
+    semantic_field.update({gram: count for gram, count in bigram_counts.items()
+                           if not any(word in french_stopwords for word in gram.split())})
+    semantic_field.update({gram: count for gram, count in trigram_counts.items()
+                           if not any(word in french_stopwords for word in gram.split())})
+
     sorted_semantic_field = dict(sorted(semantic_field.items(), key=lambda x: x[1], reverse=True)[:num_words])
     top_10_words = list(sorted_semantic_field.keys())[:10]
 
-    co_occurrences = analyze_co_occurrences(results_text, top_10_words)
+    co_occurrences = analyze_co_occurrences(results_text, top_10_words, n_gram_range=(1, 3))
 
-    return (
-        dict(sorted(semantic_field.items(), key=lambda x: x[1], reverse=True)[:num_words]),
-        co_occurrences
-    )
+    return sorted_semantic_field, co_occurrences, word_occurrences_per_url
 
 
 def main():
@@ -205,17 +254,33 @@ def main():
             st.error("Veuillez entrer une clé API et un ID CSE valides.")
         else:
             with st.spinner("Analyse en cours..."):
-                semantic_field, co_occurrences = get_serp_semantic_field(
+                semantic_field, co_occurrences, word_occurrences_per_url = get_serp_semantic_field(
                     query, cse_api_key, cse_id
                 )
-                st.subheader(f"Champ sémantique étendu pour '{query}':")
-                st.table(pd.DataFrame(list(semantic_field.items()), columns=["Mot", "Fréquence"]))
+                st.subheader(f"Champ sémantique étendu pour '{query}' (incluant 2-grams et 3-grams):")
+                st.table(pd.DataFrame(list(semantic_field.items()), columns=["Mot/Expression", "Fréquence"]))
 
-                st.subheader("Co-occurrences pour les mots cibles:")
+                st.subheader("Co-occurrences pour les mots et expressions cibles:")
                 for target_word, related_words in co_occurrences.items():
                     st.write(f"**{target_word.capitalize()}:**")
                     top_related = dict(sorted(related_words.items(), key=lambda x: x[1], reverse=True)[:10])
-                    st.table(pd.DataFrame(list(top_related.items()), columns=["Mot associé", "Fréquence"]))
+                    st.table(pd.DataFrame(list(top_related.items()), columns=["Mot/Expression associé", "Fréquence"]))
+
+                filtered_words = {
+                    word: url_counts for word, url_counts in word_occurrences_per_url.items()
+                    if len(url_counts) > 1  # Garder seulement les mots qui apparaissent dans plus d'une URL
+                }
+
+                # Trier les mots par le nombre d'URLs dans lesquels ils apparaissent
+                sorted_words = sorted(filtered_words.items(), key=lambda x: len(x[1]), reverse=True)
+
+                # Afficher les 10 premiers mots
+                for word, url_counts in sorted_words[:30]:
+                    st.write(f"**{word.capitalize()}:**")
+                    df = pd.DataFrame(list(url_counts.items()), columns=["URL", "Occurrences"])
+                    df = df.sort_values("Occurrences", ascending=False).head(30)  # Afficher les 10 premières URLs
+                    st.write(f"Apparaît dans {len(url_counts)} URLs différentes")
+                    st.table(df)
 
 
 if __name__ == "__main__":
